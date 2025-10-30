@@ -1,0 +1,12 @@
+/bin/
+/dist/
+/build/
+/*.exe
+/*.out
+/*.log
+*.DS_Store
+coverage.txt
+proxies.txt
+Archive.zip
+result.json
+go.sum
