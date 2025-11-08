@@ -91,18 +91,18 @@ func checkOneProxyOnce(ctx context.Context, p model.ProxyInput, cfg model.Config
 	var res model.ProxyCheckResult
 	switch cfg.ProxyType {
     case "socks5":
-        res = checkSOCKS5(proxyCtx, p)
+        res = checkSOCKS5(proxyCtx, p, cfg.Resolver)
 		res.Capabilities = guessCapabilities(proxyCtx, p)
     case "https":
-        res = checkHTTPS(proxyCtx, p)
+        res = checkHTTPS(proxyCtx, p, cfg.Resolver)
     default:
-        res = checkSOCKS5(proxyCtx, p)
+        res = checkSOCKS5(proxyCtx, p, cfg.Resolver)
 		res.Capabilities = guessCapabilities(proxyCtx, p)
     }
 
 	res.LatencyMs = time.Since(start).Milliseconds()
 
-	// fraud score now uses the ISP/org we got from ipinfo
+	// fraud score now uses the ISP/org
 	if res.IP != "" {
 		res.FraudScore = EstimateFraudScore(res.IP, res.ISP)
 	}
@@ -145,25 +145,15 @@ func guessCapabilities(ctx context.Context, in model.ProxyInput) model.ProxyCapa
 // HTTP(S) proxy checker implementation
 // ------------------------------------------------------------------------------------
 
-// ipinfoResponse is what we get from https://ipinfo.io/json
-// (unauthenticated limited version).
-type ipinfoResponse struct {
-	IP       string `json:"ip"`
-	City     string `json:"city"`
-	Region   string `json:"region"`
-	Country  string `json:"country"`
-	Org      string `json:"org"`      // e.g. "AS44291 INFOMIR AS"
-	Hostname string `json:"hostname"` // may be "", ignore if empty
-}
-
 // httpbinResponse matches the fields we care about from https://httpbin.org/get.
 type httpbinResponse struct {
     Origin  string            `json:"origin"`  // what IP httpbin thinks we are
     Headers map[string]string `json:"headers"` // headers seen by httpbin
+	Status  int 		      `json:"status"`
 }
 
 // checkHTTPS tries to reach probeURL using the given proxy as HTTP(S) CONNECT proxy.
-func checkHTTPS(ctx context.Context, p model.ProxyInput) model.ProxyCheckResult {
+func checkHTTPS(ctx context.Context, p model.ProxyInput, resolver model.IPResolver) model.ProxyCheckResult {
 	out := model.ProxyCheckResult{
 		Input: p,
 	}
@@ -175,22 +165,6 @@ func checkHTTPS(ctx context.Context, p model.ProxyInput) model.ProxyCheckResult 
 		return out
 	}
 
-	statusCode, info, err := fetchIPInfo(ctx, client)
-	if err != nil {
-		out.Alive = false
-		out.Error = "request_error: " + err.Error()
-		return out
-	}
-
-	out.Alive = true
-	out.StatusCode = statusCode
-
-	// fill direct data from ipinfo
-	out.IP = info.IP
-	out.Country = info.Country
-	out.City = info.City
-	out.ISP = info.Org // we'll treat ASN org as ISP for now
-
 	// Step 2: get anonymity headers
 	hb, err := fetchHttpbin(ctx, client)
 	if err == nil {
@@ -201,13 +175,25 @@ func checkHTTPS(ctx context.Context, p model.ProxyInput) model.ProxyCheckResult 
 
 		out.Anonymity = DetermineAnonymity(AnonymityInput{
 			IPReportedByServer: reportedIP,
-			ProxyExitIP:        info.IP,
+			ProxyExitIP:        hb.Origin,
 			HeadersObserved:    hb.Headers,
 		})
 	} else {
 		// if httpbin fails, fallback
 		out.Anonymity = "unknown"
 	}
+
+	info, err := resolver.Lookup(hb.Origin)
+	if err != nil {
+		return out
+	}
+
+	out.Alive = true
+	out.StatusCode = hb.Status
+	out.IP = hb.Origin
+	out.Country = info.Country
+	out.City = info.City
+	out.ISP = info.ISP // we'll treat ASN org as ISP for now
 
 	return out
 }
@@ -216,7 +202,7 @@ func checkHTTPS(ctx context.Context, p model.ProxyInput) model.ProxyCheckResult 
 // SOCKS5 proxy checker implementation
 // ------------------------------------------------------------------------------------
 
-func checkSOCKS5(ctx context.Context, p model.ProxyInput) model.ProxyCheckResult {
+func checkSOCKS5(ctx context.Context, p model.ProxyInput, resolver model.IPResolver) model.ProxyCheckResult {
 	out := model.ProxyCheckResult{
 		Input: p,
 	}
@@ -228,20 +214,6 @@ func checkSOCKS5(ctx context.Context, p model.ProxyInput) model.ProxyCheckResult
 		return out
 	}
 
-	statusCode, info, err := fetchIPInfo(ctx, client)
-	if err != nil {
-		out.Alive = false
-		out.Error = "request_error: " + err.Error()
-		return out
-	}
-
-	out.Alive = true
-	out.StatusCode = statusCode
-	out.IP = info.IP
-	out.Country = info.Country
-	out.City = info.City
-	out.ISP = info.Org
-
 	hb, err := fetchHttpbin(ctx, client)
 	if err == nil {
 		out.RawHeaders = hb.Headers
@@ -250,12 +222,24 @@ func checkSOCKS5(ctx context.Context, p model.ProxyInput) model.ProxyCheckResult
 
 		out.Anonymity = DetermineAnonymity(AnonymityInput{
 			IPReportedByServer: reportedIP,
-			ProxyExitIP:        info.IP,
+			ProxyExitIP:        hb.Origin,
 			HeadersObserved:    hb.Headers,
 		})
 	} else {
 		out.Anonymity = "unknown"
 	}
+
+	info, err := resolver.Lookup(hb.Origin)
+	if err != nil {
+		return out
+	}
+
+	out.Alive = true
+	out.StatusCode = hb.Status
+	out.IP = hb.Origin
+	out.Country = info.Country
+	out.City = info.City
+	out.ISP = info.ISP
 
 	return out
 }
@@ -263,31 +247,6 @@ func checkSOCKS5(ctx context.Context, p model.ProxyInput) model.ProxyCheckResult
 // ------------------------------------------------------------------------------------
 // Shared helpers for performing the probe request and building clients
 // ------------------------------------------------------------------------------------
-
-// doProbeRequest sends GET probeURL using provided *http.Client and returns:
-// - HTTP status code
-// - headers map[string]string seen by remote (from response body interpretation)
-// - error if something failed
-func fetchIPInfo(ctx context.Context, client *http.Client) (int, ipinfoResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://ipinfo.io/json", nil)
-	if err != nil {
-		return 0, ipinfoResponse{}, err
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, ipinfoResponse{}, err
-	}
-	defer resp.Body.Close()
-
-	var parsed ipinfoResponse
-	dec := json.NewDecoder(resp.Body)
-	if err := dec.Decode(&parsed); err != nil {
-		return resp.StatusCode, ipinfoResponse{}, err
-	}
-
-	return resp.StatusCode, parsed, nil
-}
 
 // buildHTTPClientForProxy builds an *http.Client that tunnels through an HTTP(S) proxy.
 func buildHTTPClientForProxy(p model.ProxyInput, ctx context.Context) (*http.Client, error) {
@@ -386,6 +345,7 @@ func fetchHttpbin(ctx context.Context, client *http.Client) (httpbinResponse, er
     if err := dec.Decode(&parsed); err != nil {
         return httpbinResponse{}, err
     }
+	parsed.Status = resp.StatusCode
 
     return parsed, nil
 }

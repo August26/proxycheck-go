@@ -57,6 +57,14 @@ func main() {
 
 	log.Info("proxies loaded", "count", len(proxies))
 
+	resolver, err := checker.NewResolver()
+	if err != nil {
+		log.Error(err.Error())
+		os.Exit(1)
+	}
+	defer resolver.Close()
+	cfg.Resolver = resolver
+
 	ctx := context.Background()
 	start := time.Now()
 

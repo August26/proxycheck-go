@@ -10,3 +10,5 @@ proxies.txt
 Archive.zip
 result.json
 go.sum
+*.zip
+proxycheck-go

@@ -1,6 +1,6 @@
 package checker
 
-import "strings"
+// import "strings"
 
 // ClassifyAnonymity tries to guess anonymity level based on what the
 // destination server reports seeing.

@@ -1,5 +1,15 @@
 package model
 
+type GeoInfo struct {
+    Country string
+    City    string
+    ISP     string
+}
+
+type IPResolver interface {
+	Lookup(ip string) (GeoInfo, error)
+}
+
 type Config struct {
     ProxyType       string // https or socks5
     TimeoutSeconds  int
@@ -10,5 +20,6 @@ type Config struct {
 	Concurrency      int
 	Verbose          bool
 	Retries           int // how many retry attempts per proxy
+	Resolver 		IPResolver
 }
 
